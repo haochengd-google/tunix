@@ -133,7 +133,7 @@ jobs:
     runs-on: [linux-x86-ct6e-180-8tpu]
     environment: testing
     container:
-      image: vllm/vllm-tpu:nightly-20260406-581c4d4-f6983f0
+      image: vllm/vllm-tpu:nightly-20260731-df7d1ff-a7a204c
       options: --privileged
       env:
         CLOUD_TPU_ACCELERATOR: v5e-8
@@ -217,7 +217,7 @@ jobs:
           apt-get update; apt-get install -y less
 
           cd tunix && python3 tests/generate/sglang_jax_sampler_test.py && python3 tests/generate/sglang_jax_lora_test.py
-          python3 tests/rl/rl_cluster_test.py
+          python3 -m pytest tests/rl/rl_cluster_test.py -v --tb=short -k "not vllm"
       - name: Run tunix SFT integration tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
