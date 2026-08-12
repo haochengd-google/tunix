@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from flax import nnx
 import jax
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as mask_lib
 import jax.numpy as jnp
+import numpy as np
 import qwix
 from tunix.models.gemma4 import model as model_lib
 
@@ -64,6 +67,26 @@ class ModelTest(absltest.TestCase):
     self.assertEqual(it_config.num_kv_heads, config.num_kv_heads)
     self.assertEqual(it_config.num_global_kv_heads, config.num_global_kv_heads)
     self.assertEqual(it_config.attention_pattern, config.attention_pattern)
+
+  def test_kv_cache_sharing_patterns_type_aware(self):
+    patterns = model_lib.create_kv_cache_sharing_patterns(
+        num_layers=12,
+        frac_shared_layers=0.5,
+        share_global=True,
+        share_local=True,
+        attention_types=model_lib.GEMMA4_ATTENTION_PATTERN * 2,
+    )
+    self.assertEqual(patterns, [0, 1, 2, 3, 4, 5, 4, 4, 4, 4, 4, 5])
+
+  def test_kv_cache_sharing_patterns_raises_on_missing_lender(self):
+    with self.assertRaises(ValueError):
+      model_lib.create_kv_cache_sharing_patterns(
+          num_layers=6,
+          frac_shared_layers=0.5,
+          share_global=True,
+          share_local=True,
+          attention_types=model_lib.GEMMA4_ATTENTION_PATTERN,
+      )
 
   def test_forward_pass_dense(self):
     config = model_lib.ModelConfig.gemma4_e2b()
@@ -606,6 +629,164 @@ class ModelTest(absltest.TestCase):
         audios=audios,
     )
     self.assertEqual(logits.shape, (batch_size, seq_len, config.num_embed))
+
+
+class FlashAttentionMaskTest(parameterized.TestCase):
+  """Mask correctness unit tests (pure numpy — no model needed)."""
+
+  def test_local_mask_matches_manual(self):
+    """Verify LocalMask with offset produces the correct sliding window mask."""
+    chunk_len = 1024
+    sw_size = 512
+    cache_len = sw_size
+    kv_len = cache_len + chunk_len
+    prefix_len = cache_len
+
+    # Splash mask with offset
+    splash_mask = mask_lib.LocalMask(
+        (chunk_len, kv_len),
+        window_size=(sw_size - 1, 0),
+        offset=prefix_len,
+    )
+    splash_array = splash_mask[np.s_[:, :]]
+
+    # Manual mask (replicating _build_chunked_prefill_mask logic for LOCAL)
+    position_offset = prefix_len
+    valid_cache_len = prefix_len
+    row_pos = np.arange(chunk_len) + position_offset
+    col_pos_cache = np.arange(cache_len) + (position_offset - valid_cache_len)
+    col_pos_suffix = np.arange(chunk_len) + position_offset
+    col_pos = np.concatenate([col_pos_cache, col_pos_suffix])
+    manual_mask = (col_pos[None, :] > (row_pos[:, None] - sw_size)) & (
+        col_pos[None, :] <= row_pos[:, None]
+    )
+
+    np.testing.assert_array_equal(splash_array, manual_mask)
+
+  def test_causal_mask_matches_manual(self):
+    """Verify CausalMask with offset for GLOBAL chunked prefill."""
+    chunk_len = 1024
+    prefix_len = 2048
+    kv_len = prefix_len + chunk_len
+
+    splash_mask = mask_lib.CausalMask(
+        (chunk_len, kv_len),
+        offset=prefix_len,
+    )
+    splash_array = splash_mask[np.s_[:, :]]
+
+    # Manual: q[i] can attend to kv[j] where i + offset >= j
+    row = np.arange(chunk_len)[:, None] + prefix_len
+    col = np.arange(kv_len)[None, :]
+    manual_mask = row >= col
+
+    np.testing.assert_array_equal(splash_array, manual_mask)
+
+  @parameterized.parameters(
+      # (chunk_len, sw_size) — various sizes to test edge cases
+      (256, 128),
+      (512, 256),
+      (1024, 512),
+      (2048, 1024),
+  )
+  def test_local_mask_offset_parameterized(self, chunk_len, sw_size):
+    """LocalMask with offset is correct for various chunk/window sizes."""
+    cache_len = sw_size
+    kv_len = cache_len + chunk_len
+
+    splash_mask = mask_lib.LocalMask(
+        (chunk_len, kv_len),
+        window_size=(sw_size - 1, 0),
+        offset=cache_len,
+    )
+    splash_array = splash_mask[np.s_[:, :]]
+
+    # Each Q position q[i] at logical position (i + cache_len) should attend
+    # to KV positions in [i + cache_len - (sw_size - 1), i + cache_len].
+    for i in range(0, chunk_len, max(1, chunk_len // 8)):
+      logical_q = i + cache_len
+      expected_start = max(0, logical_q - (sw_size - 1))
+      expected_end = logical_q
+      # Verify True positions in row i
+      true_cols = np.where(splash_array[i])[0]
+      if len(true_cols) > 0:
+        self.assertEqual(true_cols[0], expected_start)
+        self.assertEqual(true_cols[-1], expected_end)
+        self.assertEqual(len(true_cols), expected_end - expected_start + 1)
+
+  def test_local_mask_square_no_offset(self):
+    """Square LocalMask (chunk 1) should produce standard sliding window."""
+    seq_len = 512
+    sw_size = 128
+
+    splash_mask = mask_lib.LocalMask(
+        (seq_len, seq_len),
+        window_size=(sw_size - 1, 0),
+        offset=0,
+    )
+    splash_array = splash_mask[np.s_[:, :]]
+
+    # Manual: standard causal sliding window
+    row = np.arange(seq_len)[:, None]
+    col = np.arange(seq_len)[None, :]
+    manual_mask = (col <= row) & (col > row - sw_size)
+
+    np.testing.assert_array_equal(splash_array, manual_mask)
+
+
+class FlashAttentionBlockSizeTest(parameterized.TestCase):
+  """Block-size divisibility parameterized test."""
+
+  @parameterized.parameters(
+      model_lib.ModelConfig.gemma4_e2b,
+      model_lib.ModelConfig.gemma4_e4b,
+      model_lib.ModelConfig.gemma4_31b,
+      model_lib.ModelConfig.gemma4_26b_a4b,
+  )
+  def test_block_kv_divisibility(self, config_factory):
+    """block_kv must divide kv_len and be a multiple of 128 (NUM_LANES)."""
+    config = config_factory()
+    sw = config.sliding_window_size
+    block_q = config.flash_attention_block_size
+    block_kv = min(block_q, sw)
+    chunk_len = block_q  # Minimum valid chunk size
+    kv_len = sw + chunk_len
+
+    self.assertEqual(chunk_len % block_q, 0)
+    self.assertEqual(kv_len % block_kv, 0)
+    self.assertEqual(
+        block_kv % 128,
+        0,
+        f"block_kv={block_kv} not a multiple of 128 (NUM_LANES)",
+    )
+
+  @parameterized.parameters(
+      model_lib.ModelConfig.gemma4_e2b,
+      model_lib.ModelConfig.gemma4_e4b,
+      model_lib.ModelConfig.gemma4_31b,
+      model_lib.ModelConfig.gemma4_26b_a4b,
+  )
+  def test_block_kv_divides_multiple_chunk_sizes(self, config_factory):
+    """block_kv should work for chunk_len = 1x, 2x, 4x block_q."""
+    config = config_factory()
+    sw = config.sliding_window_size
+    block_q = config.flash_attention_block_size
+    block_kv = min(block_q, sw)
+
+    for multiplier in [1, 2, 4]:
+      chunk_len = block_q * multiplier
+      kv_len = sw + chunk_len
+      self.assertEqual(
+          chunk_len % block_q,
+          0,
+          f"chunk_len={chunk_len} not divisible by block_q={block_q}",
+      )
+      self.assertEqual(
+          kv_len % block_kv,
+          0,
+          f"kv_len={kv_len} not divisible by block_kv={block_kv} "
+          f"(multiplier={multiplier})",
+      )
 
 
 if __name__ == "__main__":
