@@ -36,6 +36,9 @@ from tunix.cli.utils import model as model_utils
 from tunix.experimental.train import peft_trainer_v2
 from tunix.experimental.worker import remote_execution
 from tunix.experimental.worker import trainer_worker
+from tunix.experimental.worker import raiden_tpu_worker
+from tunix.models.gemma import model as gemma_model_lib
+from tunix.models.gemma import params_safetensors as gemma_params_lib
 from tunix.models.qwen3 import model as qwen3_model_lib
 from tunix.models.qwen3 import params as qwen3_params_lib
 
@@ -176,10 +179,21 @@ def _load_qwen3(args, mesh: Mesh, *, lora: bool):
         "--model_dir is required for JAX trainer weights. Set MODEL_DIR or pass "
         "--model_dir=/path/to/local/qwen3/safetensors."
     )
-  config = _qwen3_config(args.model_name)
-  model = qwen3_params_lib.create_model_from_safe_tensors(
-      args.model_dir, config, mesh, dtype=jnp.bfloat16
-  )
+  normalized = args.model_name.lower()
+  if "gemma" in normalized:
+    gemma_config = (
+        gemma_model_lib.ModelConfig.gemma2_2b()
+        if "gemma-2" in normalized or "gemma2" in normalized
+        else gemma_model_lib.ModelConfig.gemma_2b()
+    )
+    model = gemma_params_lib.create_model_from_safe_tensors(
+        args.model_dir, gemma_config, mesh=mesh
+    )
+  else:
+    config = _qwen3_config(args.model_name)
+    model = qwen3_params_lib.create_model_from_safe_tensors(
+        args.model_dir, config, mesh, dtype=jnp.bfloat16
+    )
   if not lora:
     return model
   lora_config = {
@@ -199,6 +213,15 @@ class _MeshBoundTrainer:
   def __init__(self, trainer: peft_trainer_v2.PeftTrainer, mesh: Mesh):
     self._trainer = trainer
     self._mesh = mesh
+    host_stage = os.environ.get("HOST_STAGE", "auto").lower()
+    self._tpu_worker = raiden_tpu_worker.RaidenTpuWorker(
+        "trainer",
+        host_stage=(
+            "proxy" in os.environ.get("JAX_PLATFORMS", "")
+            if host_stage == "auto"
+            else host_stage == "true"
+        ),
+    )
 
   def __getattr__(self, name: str) -> Any:
     return getattr(self._trainer, name)
@@ -225,9 +248,24 @@ class _MeshBoundTrainer:
     with self._mesh:
       self._trainer.compile(*args, **kwargs)
 
-  def prepare_weight_sync(self, **kwargs) -> Any:
+  def prepare_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
+    """Stages this round's weights on the TPU worker, returns metadata."""
+    del sync_request, kwargs
+    from flax import nnx  # pylint: disable=g-import-not-at-top
+
     with self._mesh:
-      return self._trainer.prepare_weight_sync(**kwargs)
+      state = nnx.state(self._trainer.model)
+      self._tpu_worker.bind(state)
+      self._tpu_worker.d2h()
+      if os.environ.get("VERIFY_WEIGHTS", "").lower() == "true":
+        logging.info("source checksums: %s", self._tpu_worker.checksums())
+    return [self._tpu_worker.work_unit_metadata()]
+
+  def release_weight_sync(self, **kwargs) -> Any:
+    del kwargs
+    if self._tpu_worker.bound:
+      logging.info("raiden metrics: %s", self._tpu_worker.metrics())
+    return True
 
   def close(self) -> None:
     with self._mesh:
@@ -268,6 +306,11 @@ def main(argv: list[str], context: Any = None) -> None:
 
   if context:
     context.jax.initialize()
+  if os.environ.get("TRAINER_PATHWAYS_LOCAL_INIT") == "1":
+    # Local launcher runs a no-op JaxContext; connect the proxy backend here.
+    import pathwaysutils  # pylint: disable=g-import-not-at-top
+
+    pathwaysutils.initialize()
   if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
   logging.info("Repo root inserted into sys.path: %s", REPO_ROOT)
