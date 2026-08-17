@@ -111,6 +111,12 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
     )
     self._trainer_workers = dict(trainer_workers)
     self._inference_workers = dict(inference_workers or {})
+    self._policy_version = 0
+    self._weight_sync_coordinator: Any = None
+
+  def set_weight_sync_coordinator(self, coordinator: Any) -> None:
+    """Routes sync_weights rounds through a WeightSyncCoordinator."""
+    self._weight_sync_coordinator = coordinator
 
   async def _invoke_worker(
       self,
@@ -344,23 +350,15 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
       role: datatypes.Role = datatypes.Role.ACTOR,
       target_roles: Sequence[datatypes.Role] | None = None,
   ) -> int:
-    """Executes accelerator-to-accelerator collective weight broadcast."""
-    # TODO: integrate with raiden controller instead
-    del target_roles
-    trainer = self._trainer_workers.get(role)
-    if trainer is None:
-      return 0
-    sync_metadata = await self._invoke_worker(trainer, "prepare_weight_sync")
-    if not isinstance(sync_metadata, datatypes.WeightSyncMetadata):
+    """Runs one weight sync round through the coordinator."""
+    del role, target_roles
+    if self._weight_sync_coordinator is None:
       raise RuntimeError(
-          "prepare_weight_sync must return WeightSyncMetadata; got "
-          f"{type(sync_metadata).__name__}."
+          "sync_weights needs a coordinator; call"
+          " set_weight_sync_coordinator first."
       )
-    tasks = [
-        self._invoke_worker(w, "weight_sync", metadata=sync_metadata)
-        for w in self._rollout_workers
-        if hasattr(w, "weight_sync") or hasattr(w, "asubmit")
-    ]
-    if tasks:
-      await asyncio.gather(*tasks)
-    return getattr(sync_metadata, "new_policy_version", 1)
+    result = await self._weight_sync_coordinator.sync(
+        policy_version=self._policy_version + 1
+    )
+    self._policy_version = result.policy_version
+    return result.policy_version
