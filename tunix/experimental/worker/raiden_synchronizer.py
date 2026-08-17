@@ -23,7 +23,7 @@ import jax
 from tunix.experimental.orchestrator import weight_sync
 
 try:
-  from google3.third_party.tpu_raiden.tpu_sync.api.jax import weight_synchronizer as _ws_lib
+  from tpu_sync.api.jax import weight_synchronizer as _ws_lib
 except ImportError:
   _ws_lib = None
 
