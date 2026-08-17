@@ -352,12 +352,21 @@ echo "Launching trainer node on TPU chips $TRAINER_TPU_CHIPS..."
     TRAINER_CMD+=(--use_lora)
   fi
 
-  export JAX_PLATFORMS=tpu,cpu
-  export TPU_VISIBLE_DEVICES=${TRAINER_TPU_CHIPS}
-  export TPU_VISIBLE_CHIPS=${TPU_VISIBLE_DEVICES}
-  export TPU_CHIPS_PER_HOST_BOUNDS=${TPU_CHIPS_PER_HOST_BOUNDS}
-  export TPU_HOST_BOUNDS=${TPU_HOST_BOUNDS}
-  export LIBTPU_INIT_ARGS=deepsea_chips_per_host_bounds=${TPU_CHIPS_PER_HOST_BOUNDS},deepsea_host_bounds=${TPU_HOST_BOUNDS}
+  if [[ "${TRAINER_PATHWAYS:-0}" == "1" ]]; then
+    # Chips 0-3 belong to the local Pathways worker container; the trainer
+    # is a proxy client and must not grab them.
+    export JAX_PLATFORMS=proxy,cpu
+    export JAX_BACKEND_TARGET=${JAX_BACKEND_TARGET:-grpc://127.0.0.1:29000}
+    export TRAINER_PATHWAYS_LOCAL_INIT=1
+    unset TPU_VISIBLE_DEVICES TPU_VISIBLE_CHIPS LIBTPU_INIT_ARGS
+  else
+    export JAX_PLATFORMS=tpu,cpu
+    export TPU_VISIBLE_DEVICES=${TRAINER_TPU_CHIPS}
+    export TPU_VISIBLE_CHIPS=${TPU_VISIBLE_DEVICES}
+    export TPU_CHIPS_PER_HOST_BOUNDS=${TPU_CHIPS_PER_HOST_BOUNDS}
+    export TPU_HOST_BOUNDS=${TPU_HOST_BOUNDS}
+    export LIBTPU_INIT_ARGS=deepsea_chips_per_host_bounds=${TPU_CHIPS_PER_HOST_BOUNDS},deepsea_host_bounds=${TPU_HOST_BOUNDS}
+  fi
   export PYTHONUNBUFFERED=1
   env | egrep 'JAX|TPU'
   print_command "Trainer command" "${TRAINER_CMD[@]}"

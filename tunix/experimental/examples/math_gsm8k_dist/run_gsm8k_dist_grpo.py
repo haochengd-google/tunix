@@ -259,6 +259,85 @@ def _register_workers(
     )
 
 
+class _CoordinatorWorkerShim:
+  """Presents a remote ActorHandle as a coordinator-protocol worker."""
+
+  def __init__(self, handle, worker_id, roles):
+    self._handle = handle
+    self._worker_id = worker_id
+    self._roles = frozenset(roles)
+
+  def info(self):
+    return datatypes.WorkerInfo(worker_id=self._worker_id, roles=self._roles)
+
+  async def prepare_weight_sync(self, *args, **kwargs):
+    return await self._handle.asubmit("prepare_weight_sync", *args, **kwargs)
+
+  async def release_weight_sync(self, *args, **kwargs):
+    return await self._handle.asubmit("release_weight_sync", *args, **kwargs)
+
+  async def bind_weight_sync(self, *args, **kwargs):
+    return await self._handle.asubmit("bind_weight_sync", *args, **kwargs)
+
+  async def get_weight_sync_metadata(self, *args, **kwargs):
+    return await self._handle.asubmit("get_weight_sync_metadata", *args, **kwargs)
+
+  async def pre_weight_sync(self, *args, **kwargs):
+    return await self._handle.asubmit("pre_weight_sync", *args, **kwargs)
+
+  async def weight_sync(self, *args, **kwargs):
+    return await self._handle.asubmit("weight_sync", *args, **kwargs)
+
+  async def post_weight_sync(self, *args, **kwargs):
+    return await self._handle.asubmit("post_weight_sync", *args, **kwargs)
+
+  async def abort_weight_sync(self, *args, **kwargs):
+    return await self._handle.asubmit("abort_weight_sync", *args, **kwargs)
+
+  async def get_weight_sync_status(self, *args, **kwargs):
+    return await self._handle.asubmit("get_weight_sync_status", *args, **kwargs)
+
+
+def _enable_weight_sync(cluster, trainer_handle, rollout_handle):
+  """Routes sync rounds through the coordinator; Raiden moves the bytes
+  when RAIDEN=true, otherwise the round is protocol-only."""
+  from tunix.experimental.orchestrator import weight_sync
+  from tunix.experimental.orchestrator import weight_sync_coordinator
+  from tunix.experimental.orchestrator import worker_registry as registry_lib
+
+  class _NullHandler(weight_sync.WeightSyncHandler):
+    """Runs every phase without moving bytes; workers keep their weights."""
+
+    def register_work_unit(self, metadata):
+      del metadata
+
+    def transfer(self, src_units, dst_units, req_id=None, generation=None):
+      del src_units, dst_units, generation
+      return weight_sync.TransferResult(req_id=req_id or "", success=True)
+
+  registry = registry_lib.WorkerRegistry()
+  registry.register(
+      _CoordinatorWorkerShim(trainer_handle, "trainer-0", {"trainer"})
+  )
+  registry.register(
+      _CoordinatorWorkerShim(rollout_handle, "rollout-0", {"rollout"})
+  )
+  if os.getenv("RAIDEN", "false").lower() == "true":
+    from tunix.experimental.orchestrator import raiden_handler
+
+    handler = raiden_handler.RaidenHandler()
+    logging.info(
+        "Raiden weight sync enabled; controller on port %d.", handler.port
+    )
+  else:
+    handler = _NullHandler()
+    logging.info("Weight sync running protocol-only; no bytes move.")
+  coordinator = weight_sync_coordinator.WeightSyncCoordinator(
+      registry, handler, controller_id="gsm8k-demo"
+  )
+  cluster.engine.set_weight_sync_coordinator(coordinator)
+
+
 def _build_step_requests(
     *,
     step: int,
@@ -429,7 +508,7 @@ def main(argv: list[str], context: Any = None) -> None:
           max_response_length=args.max_response_length,
           pad_id=pad_id,
       ),
-      sync_weights=False,
+      sync_weights=os.getenv("SYNC_WEIGHTS", "false").lower() == "true",
       on_step_begin=lambda step: logging.info("GRPO step %d starting.", step),
       on_step_end=lambda step, result: logging.info(
           "GRPO advanced to policy_version=%d train_result=%s.", step, result
@@ -439,6 +518,7 @@ def main(argv: list[str], context: Any = None) -> None:
   try:
     logging.info("Bringing up remote workers through ClusterOrchestrator.")
     cluster.bring_up_workers(dummy_data=None)
+    _enable_weight_sync(cluster, trainer_handle, rollout_handle)
     logging.info("Running SyncRLProgram through ClusterOrchestrator.run_program.")
     cluster.run_program(
         program=program,

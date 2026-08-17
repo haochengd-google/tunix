@@ -32,6 +32,11 @@ export EVAL_EVERY_N_STEPS=${EVAL_EVERY_N_STEPS:-1000000}
 export LORA_RANK=${LORA_RANK:-16}
 export LORA_ALPHA=${LORA_ALPHA:-16.0}
 export USE_LORA=${USE_LORA:-0}
+export SYNC_WEIGHTS=${SYNC_WEIGHTS:-false}
+export RAIDEN=${RAIDEN:-false}
+export SAMPLER=${SAMPLER:-legacy_vllm}
+export GEMMA_CONFIG=${GEMMA_CONFIG:-gemma2_2b}
+export HF_TOKEN=${HF_TOKEN:-}
 
 export ORCHESTRATOR_ID=$USER-orch
 export ORCHESTRATOR_PORT=20000
@@ -54,6 +59,7 @@ start_orchestrator() {
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${ORCHESTRATOR_PORT}" \
     --worker_startup_command=" \
+      SYNC_WEIGHTS=${SYNC_WEIGHTS} RAIDEN=${RAIDEN} \
       python -m tunix.experimental.distributed.runtime.main \
         --discovery_id=${ORCHESTRATOR_ID} \
         --discovery_port=${ORCHESTRATOR_PORT} \
@@ -83,7 +89,7 @@ start_trainer() {
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${TRAINER_PORT}" \
     --worker_startup_command=" \
-      python -m tunix.experimental.distributed.runtime.main \
+      HF_TOKEN=${HF_TOKEN} python -m tunix.experimental.distributed.runtime.main \
         --discovery_addrs=${ORCHESTRATOR_ID}:${ORCHESTRATOR_PORT} \
         --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor \
         --process_main=tunix.experimental.examples.math_gsm8k_dist.run_trainer_node.main \
@@ -118,7 +124,8 @@ start_rollout() {
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${ROLLOUT_PORT}" \
     --worker_startup_command=" \
-      SKIP_JAX_PRECOMPILE=1 python -m tunix.experimental.distributed.runtime.main \
+      SKIP_JAX_PRECOMPILE=1 SAMPLER=${SAMPLER} GEMMA_CONFIG=${GEMMA_CONFIG} \
+      HF_TOKEN=${HF_TOKEN} python -m tunix.experimental.distributed.runtime.main \
         --discovery_addrs=${ORCHESTRATOR_ID}:${ORCHESTRATOR_PORT} \
         --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor \
         --process_main=tunix.experimental.examples.math_gsm8k_dist.run_rollout_node.main \
