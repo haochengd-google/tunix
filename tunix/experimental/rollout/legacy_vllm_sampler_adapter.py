@@ -17,8 +17,11 @@
 import abc
 import numbers
 from typing import Any, List, Sequence
+
+from absl import logging
 import numpy as np
 
+from tunix.experimental.common import datatypes
 from tunix.experimental.rollout import sampler as base_sampler_lib
 
 Sampler = base_sampler_lib.Sampler
@@ -272,27 +275,72 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     return responses[0]
 
   # --- Weight Synchronization ---
+  def _kv_cache_rpc(self, method: str) -> None:
+    """Runs a KV cache collective on whichever engine handle is live."""
+    llm = getattr(self.vllm_sampler, "llm", None)
+    driver = getattr(self.vllm_sampler, "_driver", None)
+    try:
+      if llm is not None:
+        llm.collective_rpc(method)
+      elif driver is not None:
+        driver.llm_engine.collective_rpc(method)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      logging.warning("KV cache rpc %s failed: %s", method, exc)
+
   async def get_weight_sync_metadata(self, **kwargs) -> Any:
-    """Returns sharding specs and layout metadata across devices for weights."""
+    """Returns name, shape, dtype and sharding for every loaded weight."""
     del kwargs
-    raise NotImplementedError(
-        "get_weight_sync_metadata() not implemented for this SamplerServer."
-    )
+    if not self.vllm_sampler:
+      raise RuntimeError(
+          f"LegacyVllmSamplerAdapter [{self.server_id}] vllm_sampler is not"
+          " initialized."
+      )
+    import jax  # pylint: disable=g-import-not-at-top
+
+    entries = []
+    state = self.vllm_sampler.transformer_state
+    for path, leaf in jax.tree_util.tree_leaves_with_path(state):
+      arr = getattr(leaf, "value", leaf)
+      if not hasattr(arr, "shape"):
+        continue
+      sharding = getattr(arr, "sharding", None)
+      spec = getattr(sharding, "spec", None)
+      entries.append({
+          "name": jax.tree_util.keystr(path),
+          "shape": tuple(arr.shape),
+          "dtype": str(getattr(arr, "dtype", "")),
+          "sharding_spec": None if spec is None else tuple(spec),
+      })
+    return entries
 
   async def pre_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
-    """Prepares staging handshake prior to policy weight update."""
+    """Frees the KV cache so staging buffers fit before the transfer."""
     del sync_request, kwargs
+    if self.vllm_sampler is None:
+      return True
+    llm = getattr(self.vllm_sampler, "llm", None)
+    driver = getattr(self.vllm_sampler, "_driver", None)
+    if llm is not None:
+      llm.reset_prefix_cache()
+    elif driver is not None:
+      driver.llm_engine.reset_prefix_cache()
+    self._kv_cache_rpc("delete_kv_cache")
     return True
 
   async def weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
-    """Updates model weights in-place from the specified controller."""
+    """Updates model weights in-place when the request carries them."""
     del kwargs
-    if (
-        sync_request is not None
-        and self.vllm_sampler
-        and hasattr(self.vllm_sampler, "update_params")
+    if sync_request is None or not self.vllm_sampler:
+      return True
+    if not hasattr(self.vllm_sampler, "update_params"):
+      return True
+    weights = getattr(sync_request, "weights", None)
+    if weights is None and not isinstance(
+        sync_request,
+        (datatypes.WeightSyncRequest, datatypes.WeightSyncMetadata),
     ):
-      weights = getattr(sync_request, "weights", sync_request)
+      weights = sync_request
+    if weights is not None:
       self.vllm_sampler.update_params(weights)
     return True
 
@@ -307,8 +355,11 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     return base_sampler_lib.LoadInfo()
 
   async def post_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
-    """Finalizes and switches active policy weights after transfer completion."""
+    """Rebuilds the KV cache and switches to the new weights."""
     del sync_request, kwargs
+    if self.vllm_sampler is None:
+      return True
+    self._kv_cache_rpc("reinitialize_kv_cache")
     return True
 
   async def migrate_kv_cache(

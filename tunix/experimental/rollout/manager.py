@@ -258,6 +258,12 @@ class RolloutManager:
     """Reopens request admission after a weight sync round."""
     return self._traffic.reopen()
 
+  async def get_weight_sync_metadata(self, **kwargs) -> Any:
+    """Returns the sampler's transport metadata for weight sync registration."""
+    if self.sampler:
+      return await self.sampler.get_weight_sync_metadata(**kwargs)
+    return []
+
   async def pre_weight_sync(
       self, sync_request: sampler_lib.WeightSyncRequest | Any = None, **kwargs
   ) -> Any:
@@ -288,11 +294,5 @@ class RolloutManager:
     if self.sampler:
       res = await self.sampler.post_weight_sync(sync_request, **kwargs)
     self.resume_all()
-    self._traffic.reopen()
+    self.reopen_admission()
     return res
-
-  async def get_weight_sync_metadata(self, **kwargs) -> Any:
-    """Returns the sampler's transport metadata for weight sync registration."""
-    if self.sampler:
-      return await self.sampler.get_weight_sync_metadata(**kwargs)
-    return []
