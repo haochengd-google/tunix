@@ -27,7 +27,11 @@ import jax
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from transformers import AutoTokenizer
+from tunix.experimental.worker import raiden_tpu_worker
 from tunix.experimental.rollout import legacy_vllm_sampler_adapter
+from tunix.experimental.rollout import vanilla_sampler_adapter
+from tunix.models.gemma import model as gemma_model_lib
+from tunix.models.gemma import params_safetensors as gemma_params_lib
 from tunix.experimental.worker import remote_execution
 from tunix.experimental.worker import rollout_worker
 from tunix.generate import mappings as mappings_lib
@@ -58,6 +62,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
   parser.add_argument("--use_lora", action="store_true")
   parser.add_argument("--lora_rank", type=int, default=16)
   parser.add_argument("--lora_alpha", type=float, default=16.0)
+  parser.add_argument(
+      "--sampler",
+      type=str,
+      default=os.getenv("SAMPLER", "legacy_vllm"),
+      choices=["legacy_vllm", "vanilla_gemma"],
+  )
+  parser.add_argument(
+      "--gemma_config",
+      type=str,
+      default=os.getenv("GEMMA_CONFIG", "gemma2_2b"),
+      choices=["gemma_2b", "gemma2_2b"],
+  )
   return parser.parse_args(argv)
 
 
@@ -141,6 +157,89 @@ class _GSM8KDemoAgent(base_agent.ConversationAgentBase):
     )
     self.chat_completions.append({"role": "assistant", "content": response})
     return action
+
+
+class _RaidenVanillaSampler(vanilla_sampler_adapter.VanillaSamplerAdapter):
+  """Native gemma sampler facade; device work runs on its TPU workers."""
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._tpu_workers = [raiden_tpu_worker.RaidenTpuWorker("rollout")]
+    self._version = 0
+
+  def _bound_workers(self):
+    for worker in self._tpu_workers:
+      worker.bind(self.sampler.transformer_state)
+    return self._tpu_workers
+
+  async def bind_weight_sync(self, **kwargs):
+    del kwargs
+    self._bound_workers()
+    return None
+
+  async def get_weight_sync_metadata(self, **kwargs):
+    del kwargs
+    return [w.work_unit_metadata() for w in self._bound_workers()]
+
+  async def pre_weight_sync(self, sync_request=None, **kwargs):
+    del sync_request, kwargs
+    self._bound_workers()
+    return True
+
+  async def weight_sync(self, sync_request=None, **kwargs):
+    del kwargs
+    for worker in self._bound_workers():
+      worker.h2d()
+      if os.environ.get("VERIFY_WEIGHTS", "").lower() == "true":
+        logging.info("destination checksums: %s", worker.checksums())
+    self._version = getattr(sync_request, "policy_version", self._version + 1)
+    return self._version
+
+  async def post_weight_sync(self, sync_request=None, **kwargs):
+    del sync_request, kwargs
+    for worker in self._tpu_workers:
+      logging.info("raiden metrics: %s", worker.metrics())
+    return True
+
+
+def _create_gemma_vanilla_worker(args, tokenizer):
+  logging.info("Creating native gemma sampler on the rollout mesh...")
+  mesh = _create_rollout_mesh()
+  model_config = getattr(
+      gemma_model_lib.ModelConfig, args.gemma_config
+  )()
+  with mesh:
+    model = gemma_params_lib.create_model_from_safe_tensors(
+        args.model_dir or args.model_id, model_config, mesh=mesh
+    )
+  sampler_adapter = _RaidenVanillaSampler(
+      server_id=args.worker_id,
+      transformer=model,
+      tokenizer=tokenizer,
+      cache_config=args.max_prompt_length + args.max_response_length,
+  )
+  rollout_tokenizer = tokenizer_adapter_lib.TokenizerAdapter(tokenizer)
+  chat_parser = chat_parser_lib.QwenChatTemplateParser(
+      tokenizer, enable_thinking=False
+  )
+  config = rollout_worker.RolloutConfig(
+      sampler_type="vanilla",
+      max_prompt_length=args.max_prompt_length,
+      max_tokens_to_generate=args.max_response_length,
+      temperature=1.0,
+      top_p=1.0,
+      return_logprobs=True,
+  )
+  return rollout_worker.RolloutWorker(
+      worker_id=args.worker_id,
+      config=config,
+      sampler=sampler_adapter,
+      env_pool=_GSM8KDemoEnvPool(),
+      agent_factory=_GSM8KDemoAgent,
+      tokenizer=rollout_tokenizer,
+      chat_parser=chat_parser,
+      max_concurrency=64,
+  )
 
 
 def _create_vllm_worker(args, tokenizer):
@@ -243,8 +342,11 @@ def main(argv: list[str], context: Any = None) -> None:
     tokenizer.pad_token = tokenizer.eos_token
 
   async def grpc_server_main() -> None:
-    logging.info("Creating rollout worker service...")
-    worker_service = _create_vllm_worker(args, tokenizer)
+    logging.info("Creating rollout worker service (%s)...", args.sampler)
+    if args.sampler == "vanilla_gemma":
+      worker_service = _create_gemma_vanilla_worker(args, tokenizer)
+    else:
+      worker_service = _create_vllm_worker(args, tokenizer)
 
     logging.info("Creating rollout gRPC server...")
     server = remote_execution.GrpcRemoteExecutionServer(worker_service)
@@ -273,3 +375,4 @@ def main(argv: list[str], context: Any = None) -> None:
 
 if __name__ == "__main__":
   main(sys.argv[1:])
+
