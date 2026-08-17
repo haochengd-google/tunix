@@ -254,6 +254,7 @@ class TrainerWorker(abstract_worker.Worker):
 
   def release_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Releases this round's staging and restores READY."""
+    del sync_request
     release = getattr(self._trainer, "release_weight_sync", None)
     result = release(**kwargs) if release else None
     if self.state == WorkerState.SYNCING:
