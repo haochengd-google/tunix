@@ -80,7 +80,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def _create_rollout_mesh() -> Mesh:
   shape = (1, jax.device_count())
   devices = mesh_utils.create_device_mesh(shape, jax.devices())
-  return Mesh(devices, axis_names=("dp", "tp"))
+  return Mesh(devices, axis_names=("fsdp", "tp"))
 
 
 class _GSM8KDemoEnv(base_environment.BaseTaskEnv):
