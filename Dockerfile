@@ -7,8 +7,24 @@ ENV TZ=Etc/UTC
 
 # Install system dependencies, including Python 3 and pip
 RUN apt-get update && \
-    apt-get install -y build-essential curl git python3 python3-pip && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y \
+        vim lsof procps \
+        apt-transport-https ca-certificates gnupg
+        build-essential curl git python3 python3-pip
+
+# Install gcloud, kubectl, k9s
+RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+    | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+RUN curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | gpg --batch --yes --no-tty --dearmor -o /usr/share/keyrings/cloud.google.gpg
+RUN apt-get update && \
+    apt-get install -y \
+        google-cloud-cli \
+        google-cloud-cli-gke-gcloud-auth-plugin \
+        kubectl
+RUN curl -sS https://webinstall.dev/k9s | bash
+
+RUN rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip
 RUN python3 -m pip install --upgrade pip
@@ -47,6 +63,19 @@ RUN if [ "$INSTALL_DEEPSWE_DEPS" = "true" ]; then \
       sed -i 's/create_repo, upload_folder, HfFolder/create_repo, upload_folder/' /opt/venv/lib/python3.12/site-packages/r2egym/agenthub/utils/utils.py && \
       sed -i 's/self.commit = ParsedCommit(\*\*json.loads(self.commit_json))/self.commit = ParsedCommit(\*\*(json.loads(self.commit_json) if isinstance(self.commit_json, str) else self.commit_json))/' /opt/venv/lib/python3.12/site-packages/r2egym/agenthub/runtime/docker.py; \
     fi
+
+# --- Raiden weight-sync additions ---
+ARG JAX_PIN=0.11.0
+ARG RAIDEN_WHEEL
+RUN pip install "jax==${JAX_PIN}" "jaxlib==${JAX_PIN}" "libtpu==0.0.44" pathwaysutils
+COPY ${RAIDEN_WHEEL} /tmp/
+RUN pip install --no-deps --force-reinstall /tmp/*.whl && rm -f /tmp/*.whl
+RUN python -c "import jax, jaxlib; \
+assert jax.__version__ == '${JAX_PIN}', ('jax', jax.__version__); \
+assert jaxlib.__version__ == '${JAX_PIN}', ('jaxlib', jaxlib.__version__); \
+from tpu_sync.api.jax import weight_synchronizer; \
+from tpu_sync.rpc import raiden_controller; \
+print('ACCEPT: jax ${JAX_PIN} + raiden wheel OK')"
 
 # Set the default command to bash
 CMD ["bash"]
