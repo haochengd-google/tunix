@@ -65,7 +65,6 @@ RUN if [ "$INSTALL_DEEPSWE_DEPS" = "true" ]; then \
     fi
 
 # --- Raiden weight-sync additions ---
-# --- Raiden weight-sync additions ---
 ARG JAX_PIN=0.11.0
 ARG RAIDEN_WHEEL
 RUN pip install "jax==${JAX_PIN}" "jaxlib==${JAX_PIN}" "libtpu==0.0.44" "flax==0.12.8" pathwaysutils
@@ -77,6 +76,10 @@ RUN python -c "import jax; assert jax.__version__ == '${JAX_PIN}', jax.__version
  && python -c "from tpu_sync.api.jax import weight_synchronizer" \
  && python -c "from tpu_sync.rpc import raiden_controller" \
  && echo "ACCEPT: full stack OK"
+
+RUN python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. tunix/experimental/distributed/runtime/discovery/discovery_service.proto
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('unsloth/gemma-2-2b-it', local_dir='artifacts/gemma2_2b/models', ignore_patterns=['*.gguf','*.bin','*.pth'])"
+RUN python -c "import tunix; from tunix.experimental.distributed.runtime.discovery import discovery_service_pb2; import glob; assert glob.glob('artifacts/gemma2_2b/models/*.safetensors')" && echo "ACCEPT: full stack OK"
 
 # Set the default command to bash
 CMD ["bash"]
