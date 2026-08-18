@@ -65,17 +65,18 @@ RUN if [ "$INSTALL_DEEPSWE_DEPS" = "true" ]; then \
     fi
 
 # --- Raiden weight-sync additions ---
+# --- Raiden weight-sync additions ---
 ARG JAX_PIN=0.11.0
 ARG RAIDEN_WHEEL
-RUN pip install "jax==${JAX_PIN}" "jaxlib==${JAX_PIN}" "libtpu==0.0.44" pathwaysutils
+RUN pip install "jax==${JAX_PIN}" "jaxlib==${JAX_PIN}" "libtpu==0.0.44" "flax==0.12.8" pathwaysutils
 COPY ${RAIDEN_WHEEL} /tmp/
 RUN pip install --no-deps --force-reinstall /tmp/*.whl && rm -f /tmp/*.whl
-RUN python -c "import jax, jaxlib; \
-assert jax.__version__ == '${JAX_PIN}', ('jax', jax.__version__); \
-assert jaxlib.__version__ == '${JAX_PIN}', ('jaxlib', jaxlib.__version__); \
-from tpu_sync.api.jax import weight_synchronizer; \
-from tpu_sync.rpc import raiden_controller; \
-print('ACCEPT: jax ${JAX_PIN} + raiden wheel OK')"
+RUN python -c "import jax; assert jax.__version__ == '${JAX_PIN}', jax.__version__" \
+ && python -c "import jaxlib; assert jaxlib.__version__ == '${JAX_PIN}', jaxlib.__version__" \
+ && python -c "import tunix" \
+ && python -c "from tpu_sync.api.jax import weight_synchronizer" \
+ && python -c "from tpu_sync.rpc import raiden_controller" \
+ && echo "ACCEPT: full stack OK"
 
 # Set the default command to bash
 CMD ["bash"]
