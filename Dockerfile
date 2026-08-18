@@ -9,7 +9,7 @@ ENV TZ=Etc/UTC
 RUN apt-get update && \
     apt-get install -y \
         vim lsof procps \
-        apt-transport-https ca-certificates gnupg
+        apt-transport-https ca-certificates gnupg \
         build-essential curl git python3 python3-pip
 
 # Install gcloud, kubectl, k9s
